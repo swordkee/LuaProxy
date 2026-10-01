@@ -1,0 +1,39 @@
+# LuaProxy
+#
+# 部署期产生的文件
+dist/
+*.tar.gz
+*.log
+
+# 真实凭据 —— 只提交 conf/*.lua 模板，真实值由部署注入
+# 原版把 7 家厂商的 KeySecret / token 明文入库（见 CODE_REVIEW.md P0-6）
+conf/system.local.lua
+conf/*.local.lua
+.env
+
+# 本地覆盖
+nginx.local.conf
+*.local.yml
+
+# 编辑器 / IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# 预编译产物（.so 为仓库提供的预编译二进制，需保留）
+# *.so
+
+# 测试产物
+coverage/
+luacov.stats.out
+luacov.report.out
+.tmp/
+
+# Lua 编译缓存
+luacov.stats

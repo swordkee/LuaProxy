@@ -1,0 +1,12 @@
+return {
+    _all = {
+        -- 单测需要能 require('lib.util') 这种带目录前缀的路径
+        lpath = './?.lua;./?/init.lua',
+    },
+    default = {
+        ROOT = { 'spec' },
+        pattern = '_spec%.lua$',
+        output = 'gtest',
+        verbose = true,
+    },
+}

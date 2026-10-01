@@ -1,203 +1,117 @@
-local conf = require('conf.config')
-local utils = require('utils')
-local json = require('cjson.safe')
+--- `init_by_lua` 入口：一次性完成配置校验、适配器注册、常量预计算。
+---
+--- ## 相对 2017 年 `init.lua` 的变化
+--- 原版在 init 阶段向全局注入 `isEmpty` / `on` / `pr` / `json_decode` 等函数，
+--- 并**猴补 `string` 与 `table` 的方法**：
+--- ```lua
+--- string.split = function(...) end
+--- string.trim  = function(...) end
+--- table.len / table.merge / table.unique / table.findkeys / table.invert
+--- ```
+--- 全局污染会与其他库命名冲突、干扰基于 `pairs` 的工具链，
+--- 也让人无法判断某个函数究竟来自哪里。
+--- 本版本把它们收进 `lib/util.lua` 显式导出，不再猴补标准库。
+---
+--- 另外原版**没有任何配置校验**：`conf/*.lua` 里 key 拼错要等到线上第一次
+--- 请求命中该分支才会以 `attempt to index a nil value` 暴露。
+--- 本版本在启动期一次性校验，任一不合规即让 `nginx -s reload` 失败。
 
-function isEmpty(str)
-    local t = type(str)
-    if t == "string" then
-        return str == nil or string.len(str) == 0 or str == "" or str == ngx.null
-    elseif t == "table" then
-        return #str == 0 and table.len(str) == 0 or next(str) == nil
-    elseif t == "number" then
-        return (str == 0 and { true } or { false })[1]
-    elseif t == "boolean" then
-        return str == false
-    elseif t == 'nil' then
-        return true
-    else
-        return str;
+local configMod = require('lib.config')
+local dispatch = require('lib.dispatch')
+local upstream = require('lib.upstream')
+local ext = require('lib.ngx_ext')
+local util = require('lib.util')
+
+local type = type
+local pairs = pairs
+local ipairs = ipairs
+local sformat = string.format
+local tconcat = table.concat
+local tsort = table.sort
+
+--- 启动期构建的全局上下文。显式挂在 `_G.DMP` 下，让「谁定义了什么」一目了然。
+local DMP = {
+    cfg = nil,
+    adapters = nil,
+    warnings = nil,
+    bootMs = nil,
+}
+
+_G.DMP = DMP
+
+--- 校验配置。任一环节失败直接 error —— 配置错误应当在启动时暴露，
+--- 而不是运行中静默降级。
+local cfg, cfgErr = configMod.load()
+if cfg == nil then
+    error('[dmp] 配置校验失败:\n' .. tostring(cfgErr), 0)
+end
+DMP.cfg = cfg
+
+local adapters, adErr = dispatch.build(cfg)
+if adapters == nil then
+    error('[dmp] ' .. tostring(adErr), 0)
+end
+DMP.adapters = adapters
+
+-- 白名单自检：只告警，不阻断启动
+DMP.warnings = upstream.selfCheck(cfg)
+
+-- 把 cfg 注入需要它的适配器，避免每次 fetch 都 require conf
+for _, mod in pairs(adapters) do
+    if type(mod.setConfig) == 'function' then
+        mod.setConfig(cfg)
     end
 end
 
---简化三元表达式
-function on(boolValue, trueValue, falseValue)
-    return (boolValue and { trueValue } or { falseValue })[1]
+DMP.bootMs = ngx.now() * 1000
+
+--------------------------------------------------------------------------------
+-- 启动日志（不含任何敏感配置）
+--------------------------------------------------------------------------------
+
+local upstreamNames = {}
+for name in pairs(cfg.upstreams) do
+    upstreamNames[#upstreamNames + 1] = name
+end
+tsort(upstreamNames)
+
+ngx.log(ngx.NOTICE, sformat(
+    '[dmp] boot ok: sources=[%s] upstreams=[%s] ttl=%dms budget=%d/%dms warnings=%d',
+    tconcat(cfg.dmp, ','),
+    tconcat(upstreamNames, ','),
+    cfg.dict_ttl_ms,
+    cfg.source_budget_ms,
+    cfg.request_budget_ms,
+    #DMP.warnings
+))
+
+for _, w in ipairs(DMP.warnings) do
+    ngx.log(ngx.WARN, '[dmp] config warning: ', w)
 end
 
-function pr(...)
-    if conf.DEBUG == true then
-        local d = require "resty.dump"
-        d.dump(...)
+--------------------------------------------------------------------------------
+-- 兼容层（deprecated）
+--------------------------------------------------------------------------------
+
+--- 保留原版这几个全局函数名，内部改为薄封装，让既有调用方不必立刻改。
+--- **新代码请直接 `require('lib.util')` / `require('lib.ngx_ext')`。**
+
+--- @deprecated 请改用 `util.isBlank`
+_G.isEmpty = util.isBlank
+
+--- @deprecated 普通 `if` 即可，无需三元封装
+_G.on = function(cond, a, b)
+    if cond then
+        return a
     end
+    return b
 end
 
---function isJsonCheck(josnschema, arrayParams)
---    if conf.JSONSCHEMA == false then
---        return true
---    else
---        if isEmpty(arrayParams) then
---            return false
---        end
---        local rjson = require('rapidjson')
---        local schema = rjson.SchemaDocument(josnschema)
---        local validator = rjson.SchemaValidator(schema)
---        local ok, message = validator:validate(rjson.Document(rjson.encode(arrayParams)))
---        return ok, message
---    end
---end
+--- @deprecated 请改用 `ext.jsonDecode`
+_G.json_decode = ext.jsonDecode
 
-string.split = function(str, delimiter)
-    if isEmpty(str) or isEmpty(delimiter) then
-        return nil
-    end
-    return utils.split(str, delimiter) --3132
-    --        local result = {} -- 7530
-    --        for match in (str .. delimiter):gmatch("(.-)" .. delimiter) do
-    --            table.insert(result, match)
-    --        end
-    --        return result
-end
+--- @deprecated 请改用 `ext.jsonEncode`
+_G.json_encode = ext.jsonEncode
 
-string.trim = function(str)
-    if type(str) ~= "string" or isEmpty(str) then
-        return nil, "the string parameter is nil"
-    end
-    return utils.trim(str) --1064
-    --    return ngx.re.gsub(str, "\\s", "%20", "jo")
-    --    return string.gsub(str, "^%s*(.-)%s*$", "%1") --3886
-end
-
-table.len = function(t)
-    local c = 0
-    for _, v in pairs(t) do
-        c = c + 1
-    end
-    return c
-end
-
-table.merge = function(a, b)
-    if type(a) == 'table' and type(b) == 'table' then
-        for k, v in pairs(b) do if type(v) == 'table' and type(a[k] or false) == 'table' then table.merge(a[k], v) else a[k] = v end end
-    end
-    return a
-end
-
-table.unique = function(t)
-    local check = {}
-    local res = {}
-    for i, v in ipairs(t) do
-        if not (check[v]) then
-            check[v] = true
-            res[1 + #res] = v
-        end
-    end
-    return res
-end
-
-table.findkeys = function(t, value)
-    local res = {}
-    for k, v in pairs(t) do
-        if v == value then
-            res[1 + #res] = k
-        end
-    end
-    return res
-end
-
-table.invert = function(t)
-    local res = {}
-    for k, v in pairs(t) do
-        res[v] = k
-    end
-    return res
-end
-
-function bin2hex(s)
-    s = string.gsub(s, "(.)", function(x) return string.format("%02X", string.byte(x)) end)
-    return s
-end
-
-function table.callBack(callBack, source, code, mtype, msg)
-    local tMsg = { ["400"] = "bad request.", ["500"] = "failed to connect..." }
-    local msgs = on(not isEmpty(msg), msg, tMsg[tostring(code)])
-    local used = {}
-    if mtype ~= 'redis' then
-        used[callBack] = '0'
-    else
-        used[callBack] = '0|-2'
-    end
-    return {
-        [callBack] = {
-            code = code,
-            msg = msgs
-        }
-    }, source, used
-end
-
-function in_table(value, table)
-    if isEmpty(table) then
-        return false
-    end
-    for _, v in pairs(table) do
-        if v == value then
-            return true;
-        end
-    end
-    return false;
-end
-
-function base62(num, ver)
-    local BASE_STRING = "vPh7zZwA2LyU4bGq5tcVfIMxJi6XaSoK9CNp0OWljYTHQ8REnmu31BrdgeDkFs"
-    local BASE_STRING_MZ = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    local seed = on(ver ~= 'mz', BASE_STRING, BASE_STRING_MZ)
-    local tab = {}
-    repeat
-        local r = (num % 62) + 1
-        num = math.floor(num / 62)
-        table.insert(tab, 1, string.sub(seed, r, r))
-    until num == 0
-
-    return table.concat(tab)
-end
-
-function createIdCookie()
-    local str = base62(math.floor(ngx.now() * 1000))
-    local s1 = string.sub(str, 2, string.len(str))
-    math.randomseed(tostring(ngx.now() * 1000):reverse():sub(1, 10))
-    local s2 = string.sub(base62((ngx.var.pid + math.random(0, 61)) % (62 * 62)), -2, 2)
-    local s3 = base62(math.random(0, 61));
-    return s1 .. s2 .. s3
-end
-
-function json_decode(t)
-    return json.decode(t)
-end
-
-function json_encode(t)
-    return json.encode(t)
-end
-
-function call_user_func(func, ...)
-    local t = type(func)
-    if t == "function" then
-        return func(...)
-    elseif t == "string " then
-        if _G[func] == nil or type(_G[func]) ~= "function" then
-            ngx.log(ngx.ERR, "function is not defined '" .. func .. "'")
-        end
-        return _G[func](...)
-    elseif t == "table" then
-        local _instance = func[1]
-        local _method = func[2]
-        if _instance == nil or _method == nil then
-            ngx.log(ngx.ERR, "instance or method name is nil")
-        end
-        if _instance[_method] == nil then
-            ngx.log(ngx.ERR, "class method is not defined '" .. _method .. "'")
-        end
-        return _instance[_method](_instance, ...)
-
-    else
-        ngx.log(ngx.ERR, "func is not matched type '" .. type(func) .. "'")
-    end
-end
+--- @deprecated 请改用 `ext.newIdCookie`
+_G.createIdCookie = ext.newIdCookie
